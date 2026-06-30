@@ -179,6 +179,13 @@ _LONG_HANDLERS = frozenset(
         # portal can't stall approval.respond / session.interrupt / other RPCs.
         "billing.state",
         "subscription.state",
+        # Subscription change (V3): preview + the pending-change mutations + upgrade
+        # each do a blocking portal round-trip (preview + upgrade also hit Stripe,
+        # which can take seconds) — keep them off the main stdin loop.
+        "subscription.preview",
+        "subscription.change",
+        "subscription.resume",
+        "subscription.upgrade",
         "usage.bars",
         "session.usage",
         "billing.step_up",
@@ -5664,6 +5671,7 @@ def _(rid, params: dict) -> dict:
 def _serialize_subscription_state(state) -> dict:
     """Serialize a SubscriptionState for the wire (Decimals → strings)."""
     from agent.billing_usage import format_renews
+    from agent.billing_view import format_money
 
     def _s(value):
         return None if value is None else str(value)
@@ -5684,6 +5692,20 @@ def _serialize_subscription_state(state) -> dict:
             "cancellation_effective_at": c.cancellation_effective_at,
             "cancellation_effective_display": format_renews(c.cancellation_effective_at),
         }
+    # Selectable catalog for the in-terminal tier picker; price is pre-formatted
+    # ($X / $X.YY) so the TUI renders it directly.
+    tiers = [
+        {
+            "tier_id": t.tier_id,
+            "name": t.name,
+            "tier_order": t.tier_order,
+            "dollars_per_month_display": format_money(t.dollars_per_month),
+            "monthly_credits": _s(t.monthly_credits),
+            "is_current": t.is_current,
+            "is_enabled": t.is_enabled,
+        }
+        for t in state.tiers
+    ]
     return {
         "ok": True,
         "logged_in": state.logged_in,
@@ -5694,6 +5716,7 @@ def _serialize_subscription_state(state) -> dict:
         "role": state.role,
         "context": state.context,
         "current": current,
+        "tiers": tiers,
         "portal_url": state.portal_url,
         "error": state.error,
         # Shared dollar usage model (two-bar view) embedded so /subscription
@@ -5719,6 +5742,128 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, _serialize_subscription_state(state))
     except Exception:
         return _ok(rid, {"ok": True, "logged_in": False, "error": "could not load subscription state"})
+
+
+def _serialize_subscription_preview(p) -> dict:
+    """Serialize a SubscriptionChangePreview for the wire (Decimal → string)."""
+    return {
+        "ok": True,
+        "effect": p.effect,
+        "reason": p.reason,
+        "current_tier_id": p.current_tier_id,
+        "current_tier_name": p.current_tier_name,
+        "target_tier_id": p.target_tier_id,
+        "target_tier_name": p.target_tier_name,
+        "monthly_credits_delta": (
+            None if p.monthly_credits_delta is None else str(p.monthly_credits_delta)
+        ),
+        "amount_due_now_cents": p.amount_due_now_cents,
+        "effective_at": p.effective_at,
+    }
+
+
+@method("subscription.preview")
+def _(rid, params: dict) -> dict:
+    """POST /api/billing/subscription/preview → serialized quote or typed error.
+
+    params: {subscription_type_id: str}. Chargeless effect quote. Requires
+    billing:manage (live Stripe calls + amounts), so a 403 → insufficient_scope
+    drives the device step-up exactly like the mutations.
+    """
+    from agent.subscription_view import subscription_change_preview_from_payload
+    from hermes_cli.nous_billing import BillingError, post_subscription_preview
+
+    tier_id = params.get("subscription_type_id")
+    if not tier_id:
+        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id is required"})
+    try:
+        preview = subscription_change_preview_from_payload(
+            post_subscription_preview(subscription_type_id=tier_id)
+        )
+        return _ok(rid, _serialize_subscription_preview(preview))
+    except BillingError as exc:
+        return _ok(rid, _serialize_billing_error(exc))
+    except Exception as exc:
+        return _ok(rid, {"ok": False, "error": "error", "message": str(exc)})
+
+
+@method("subscription.change")
+def _(rid, params: dict) -> dict:
+    """PUT /api/billing/subscription/pending-change → {ok, message} or typed error.
+
+    params: {subscription_type_id?: str, cancel?: bool}. Schedules a downgrade /
+    same-price change OR a cancellation at period end (chargeless). Requires
+    billing:manage.
+    """
+    from hermes_cli.nous_billing import BillingError, put_subscription_pending_change
+
+    cancel = bool(params.get("cancel"))
+    tier_id = params.get("subscription_type_id")
+    if not cancel and not tier_id:
+        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id or cancel is required"})
+    try:
+        result = put_subscription_pending_change(subscription_type_id=tier_id, cancel=cancel)
+        return _ok(rid, {"ok": True, "message": result.get("message"), "payload": result})
+    except BillingError as exc:
+        return _ok(rid, _serialize_billing_error(exc))
+    except Exception as exc:
+        return _ok(rid, {"ok": False, "error": "error", "message": str(exc)})
+
+
+@method("subscription.resume")
+def _(rid, params: dict) -> dict:
+    """DELETE /api/billing/subscription/pending-change → {ok, message} or typed error.
+
+    Clears a scheduled downgrade or cancellation (resume / undo). Chargeless, but it
+    re-enables recurring spend → requires billing:manage and honors the kill-switch.
+    """
+    from hermes_cli.nous_billing import BillingError, delete_subscription_pending_change
+
+    try:
+        result = delete_subscription_pending_change()
+        return _ok(rid, {"ok": True, "message": result.get("message"), "payload": result})
+    except BillingError as exc:
+        return _ok(rid, _serialize_billing_error(exc))
+    except Exception as exc:
+        return _ok(rid, {"ok": False, "error": "error", "message": str(exc)})
+
+
+@method("subscription.upgrade")
+def _(rid, params: dict) -> dict:
+    """POST /api/billing/subscription/upgrade → {ok, status, ...} or typed error.
+
+    params: {subscription_type_id: str, idempotency_key?: str}. The single money
+    route: prorate + charge the card on the subscription + flip the plan. SCA /
+    decline come back as status requires_action / payment_failed with a recovery_url
+    to finish in the portal. The idempotency key is minted if absent and echoed so
+    the TUI reuses it on retry of the SAME upgrade. Requires billing:manage.
+    """
+    from agent.billing_view import new_idempotency_key
+    from hermes_cli.nous_billing import BillingError, post_subscription_upgrade
+
+    tier_id = params.get("subscription_type_id")
+    if not tier_id:
+        return _ok(rid, {"ok": False, "error": "invalid_request", "message": "subscription_type_id is required"})
+    key = params.get("idempotency_key") or new_idempotency_key()
+    try:
+        result = post_subscription_upgrade(subscription_type_id=tier_id, idempotency_key=key)
+        return _ok(
+            rid,
+            {
+                "ok": True,
+                "status": result.get("status"),
+                "target_tier_name": result.get("targetTierName"),
+                "recovery_url": result.get("recoveryUrl"),
+                "reason": result.get("reason"),
+                "idempotency_key": key,
+            },
+        )
+    except BillingError as exc:
+        env = _serialize_billing_error(exc)
+        env["idempotency_key"] = key  # so the TUI can reuse on retry
+        return _ok(rid, env)
+    except Exception as exc:
+        return _ok(rid, {"ok": False, "error": "error", "message": str(exc), "idempotency_key": key})
 
 
 
