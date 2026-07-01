@@ -3314,59 +3314,53 @@ def _sync_codex_pool_entries(
     auth_store: Dict[str, Any],
     tokens: Dict[str, str],
     last_refresh: Optional[str],
+    previous_tokens: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
+    """Mirror a fresh Codex singleton re-auth into matching pool entries.
 
     The runtime selects credentials from ``credential_pool.openai-codex``, not
-    from ``providers.openai-codex.tokens``.  A re-auth invalidates the prior
-    OAuth pair server-side, but pool entries keep holding the now-consumed
-    refresh token plus any stale error markers — so the next request spends a
-    dead token and gets a 401 ``token_invalidated``.
+    directly from ``providers.openai-codex.tokens``.  Re-authing the singleton
+    must therefore refresh the singleton-derived pool row as well.
 
-    What gets refreshed:
-
-    * ``device_code`` — the singleton-seeded entry written by the device-code
-      OAuth flow when the user logged in via ``hermes setup`` / the model
-      picker.  Always synced with the fresh tokens.
-    * ``manual:device_code`` — entries created by ``hermes auth add openai-codex``
-      that use the same device-code OAuth mechanism.  An interactive re-auth
-      proves the user owns the ChatGPT account, so it is safe (and expected)
-      to refresh these entries too.  Without this, a user who once ran the
-      ``hermes auth add`` workaround for #33000 would silently leave that
-      manual entry stale on every subsequent re-auth, recreating the issue
-      reported in #33538.
-
-    What does NOT get refreshed:
-
-    * ``manual:api_key`` and any other non-device-code manual sources — those
-      are independent credentials (an explicit API key, a different ChatGPT
-      account, etc.) and must not be overwritten by a single re-auth.
-
-    Error markers (``last_status``, ``last_error_*``) are also cleared on
-    every device-code-backed entry — even those whose tokens we did not
-    rewrite — so that an interactive re-auth gives every relevant pool entry
-    a fresh selection chance instead of leaving them marked unhealthy from a
-    pre-re-auth 401.
+    Multi-account rule: ``manual:device_code`` rows are explicit credentials
+    added via ``hermes auth add openai-codex``.  They may be a different
+    ChatGPT account, so a singleton re-auth must not blindly overwrite them.
+    Only manual rows whose token pair already matched the previous singleton
+    token pair are treated as aliases of that singleton and updated.
     """
     access_token = tokens.get("access_token")
     if not access_token:
         return
     refresh_token = tokens.get("refresh_token")
+    previous_access_token = (previous_tokens or {}).get("access_token")
+    previous_refresh_token = (previous_tokens or {}).get("refresh_token")
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         return
     entries = pool.get("openai-codex")
     if not isinstance(entries, list):
         return
-    # Sources whose tokens should be rewritten by a fresh Codex device-code
-    # OAuth re-auth.  ``manual:api_key`` and unknown sources are intentionally
-    # excluded — they represent independent credentials.
-    REFRESHABLE_SOURCES = {"device_code", "manual:device_code"}
+
+    def _manual_entry_matches_previous_singleton(entry: Dict[str, Any]) -> bool:
+        if not previous_access_token and not previous_refresh_token:
+            return False
+        entry_access = entry.get("access_token")
+        entry_refresh = entry.get("refresh_token")
+        if previous_refresh_token and entry_refresh == previous_refresh_token:
+            return True
+        if previous_access_token and entry_access == previous_access_token:
+            return True
+        return False
+
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         source = entry.get("source")
-        if source not in REFRESHABLE_SOURCES:
+        should_update = source == "device_code" or (
+            source == "manual:device_code"
+            and _manual_entry_matches_previous_singleton(entry)
+        )
+        if not should_update:
             continue
         entry["access_token"] = access_token
         if refresh_token:
@@ -3388,11 +3382,12 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
+        previous_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
         _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(auth_store, tokens, last_refresh)
+        _sync_codex_pool_entries(auth_store, tokens, last_refresh, previous_tokens)
         _save_auth_store(auth_store)
 
 

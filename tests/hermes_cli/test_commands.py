@@ -98,6 +98,14 @@ class TestResolveCommand:
         assert resolve_command("background").name == "background"
         assert resolve_command("copy").name == "copy"
         assert resolve_command("agents").name == "agents"
+        qlist = resolve_command("qlist")
+        assert qlist is not None
+        assert qlist.name == "qlist"
+
+    def test_qlist_is_cli_only(self):
+        qlist = resolve_command("qlist")
+        assert qlist is not None
+        assert qlist.cli_only is True
 
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"

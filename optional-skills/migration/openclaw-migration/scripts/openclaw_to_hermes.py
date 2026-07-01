@@ -563,7 +563,10 @@ def relative_label(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
     except ValueError:
-        return str(path)
+        # path is outside root — strip the leading slash so that
+        # archive_dir / relative_label(...) does not silently discard archive_dir
+        # (pathlib replaces the entire left side when the right side is absolute).
+        return str(path).lstrip("/")
 
 
 # ───────────────────────────────────────────────────────────────────────

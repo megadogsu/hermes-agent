@@ -150,6 +150,107 @@ class TestBusyInputMode:
         assert cli.process_command("/q follow up") is True
         assert cli._pending_input.get_nowait() == "follow up"
 
+    def test_qlist_lists_queued_prompts_without_consuming(self, capsys):
+        """/qlist should inspect the local pending queue immediately, without an API turn."""
+        cli = _make_cli()
+        cli.process_command("/queue first follow up")
+        cli.process_command("/queue second follow up")
+        capsys.readouterr()
+
+        assert cli.process_command("/qlist") is True
+        out = capsys.readouterr().out
+
+        assert "Queued commands (2)" in out
+        assert "1. first follow up" in out
+        assert "2. second follow up" in out
+        assert cli._pending_input.get_nowait() == "first follow up"
+        assert cli._pending_input.get_nowait() == "second follow up"
+
+    def test_qlist_empty_queue_is_immediate(self, capsys):
+        cli = _make_cli()
+
+        assert cli.process_command("/qlist") is True
+        out = capsys.readouterr().out
+
+        assert "Queue is empty." in out
+
+    def test_qlist_is_ui_inline_even_when_idle_with_existing_queue(self):
+        """Submitting /qlist in the TUI must bypass _pending_input FIFO order."""
+        cli = _make_cli()
+        cli._agent_running = False
+        cli._pending_input.put("queued work")
+
+        assert cli._should_handle_qlist_command_inline("/qlist") is True
+        assert cli._pending_input.get_nowait() == "queued work"
+
+    def test_qlist_is_ui_inline_while_agent_running(self):
+        """During chat(), /qlist should display status and let the run continue."""
+        cli = _make_cli()
+        cli._agent_running = True
+        cli._pending_input.put("next queued work")
+
+        assert cli._should_handle_qlist_command_inline("/qlist") is True
+        assert cli._should_handle_qlist_command_inline("/queue something") is False
+        assert cli._pending_input.get_nowait() == "next queued work"
+
+    def test_qlist_uses_tui_safe_print_when_app_is_running(self, capsys):
+        """In the live TUI, /qlist must render through _cprint, not raw print()."""
+        cli = _make_cli()
+        cli._app = object()
+        cli._agent_running = True
+        cli._pending_input.put("next queued work")
+        cprint = MagicMock()
+
+        with patch.dict(cli._handle_qlist_command.__globals__, {"_cprint": cprint}):
+            assert cli.process_command("/qlist") is True
+
+        out = capsys.readouterr().out
+        assert out == ""
+        cprint.assert_any_call("  Queued commands (1):")
+        cprint.assert_any_call("  1. next queued work")
+        assert cli._pending_input.get_nowait() == "next queued work"
+
+    def test_qlist_empty_uses_tui_safe_print_when_app_is_running(self, capsys):
+        cli = _make_cli()
+        cli._app = object()
+        cprint = MagicMock()
+
+        with patch.dict(cli._handle_qlist_command.__globals__, {"_cprint": cprint}):
+            assert cli.process_command("/qlist") is True
+
+        out = capsys.readouterr().out
+        assert out == ""
+        cprint.assert_called_once_with("  Queue is empty.")
+
+    def test_transient_queue_failure_requeues_front_without_draining_rest(self):
+        """429/disconnect failures keep the failed queued turn at the front."""
+        cli = _make_cli()
+        cli._pending_input.put("second queued turn")
+        cli._last_chat_queue_preserve_error = "429 rate limit: retry-after 60"
+        cprint = MagicMock()
+
+        with patch.dict(cli._preserve_failed_queued_input.__globals__, {"_cprint": cprint}):
+            assert cli._preserve_failed_queued_input("first queued turn") is True
+
+        assert any("Queued message preserved" in str(call) for call in cprint.call_args_list)
+        assert cli._pending_input_retry_at > 0
+        assert cli._pending_input.get_nowait() == "first queued turn"
+        assert cli._pending_input.get_nowait() == "second queued turn"
+
+    def test_queue_preservation_detects_rate_limit_and_disconnect_errors(self):
+        cli = _make_cli()
+
+        assert cli._is_queue_preserving_error("HTTP 429 Too Many Requests") is True
+        assert cli._is_queue_preserving_error("provider disconnected before response") is True
+        assert cli._is_queue_preserving_error("invalid tool argument") is False
+
+    def test_queue_retry_delay_honors_retry_after(self):
+        cli = _make_cli()
+
+        assert cli._queue_retry_delay_seconds("429 retry-after: 42") == 42
+        assert cli._queue_retry_delay_seconds("rate limit reset in 2 minutes") == 120
+        assert cli._queue_retry_delay_seconds("429 without reset header") == 300
+
     def test_queue_mode_routes_busy_enter_to_pending(self):
         """In queue mode, Enter while busy should go to _pending_input, not _interrupt_queue."""
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})

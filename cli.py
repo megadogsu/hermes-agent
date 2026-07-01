@@ -63,7 +63,7 @@ from prompt_toolkit.layout.processors import Processor, Transformation, Password
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.widgets import SearchToolbar, TextArea
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit import print_formatted_text as _pt_print
 from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
@@ -173,6 +173,15 @@ from utils import base_url_host_matches
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+
+
+def _tmux_resume_marker_dir() -> Path:
+    """Directory used by tmux-resurrect hooks to discover live Hermes sessions."""
+    return _hermes_home / "runtime" / "tmux-resurrect"
+
+
+def _tmux_resume_marker_path(pid: int | None = None) -> Path:
+    return _tmux_resume_marker_dir() / f"{pid or os.getpid()}.tsv"
 
 
 _REASONING_TAGS = (
@@ -3201,6 +3210,13 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Queue preservation guard: if a queued turn fails before it can be
+        # processed (rate limit, provider disconnect, credential/runtime
+        # startup failure), put it back at the front and do not immediately
+        # drain/retry the queue.  The process loop honors _pending_input_retry_at
+        # before popping again, so a 429 does not burn through every queued item.
+        self._last_chat_queue_preserve_error: str | None = None
+        self._pending_input_retry_at: float = 0.0
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -3269,6 +3285,140 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+
+        self._write_tmux_resume_marker()
+        atexit.register(self._remove_tmux_resume_marker)
+
+    def _write_tmux_resume_marker(self) -> None:
+        """Publish current session id for tmux-resurrect auto-resume hooks.
+
+        tmux-resurrect can see the pane process tree, but a fresh Hermes
+        invocation does not have ``--resume <id>`` in argv.  This small marker,
+        keyed by PID and updated whenever the active session changes, lets the
+        tmux hook restore the pane as ``hermes --resume <id>`` next time.
+        """
+        try:
+            marker_dir = _tmux_resume_marker_dir()
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            profile = "default"
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile = get_active_profile_name() or "default"
+            except Exception:
+                pass
+            cwd = os.getcwd()
+            tmp = _tmux_resume_marker_path().with_suffix(".tmp")
+            tmp.write_text(
+                f"{self.session_id}\t{cwd}\t{profile}\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, _tmux_resume_marker_path())
+        except Exception:
+            logger.debug("Failed to write tmux resume marker", exc_info=True)
+
+    def _remove_tmux_resume_marker(self) -> None:
+        try:
+            _tmux_resume_marker_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _set_session_id(self, session_id: str) -> None:
+        self.session_id = session_id
+        self._write_tmux_resume_marker()
+
+    def _push_pending_input_front(self, item) -> bool:
+        """Put an item back at the front of the pending-input queue."""
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return False
+        mutex = getattr(pending, "mutex", None)
+        queue_items = getattr(pending, "queue", None)
+        not_empty = getattr(pending, "not_empty", None)
+        unfinished_tasks = getattr(pending, "unfinished_tasks", 0) or 0
+        if mutex is None or queue_items is None or not_empty is None:
+            return False
+        with mutex:
+            if hasattr(queue_items, "appendleft"):
+                queue_items.appendleft(item)
+            else:
+                queue_items.append(item)
+            try:
+                pending.unfinished_tasks = unfinished_tasks + 1
+            except Exception:
+                pass
+            not_empty.notify()
+        return True
+
+    @staticmethod
+    def _is_queue_preserving_error(error: object) -> bool:
+        """Return True for transient errors where queued input should be kept."""
+        text = str(error or "").lower()
+        if not text:
+            return False
+        transient_needles = (
+            "429",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "retry-after",
+            "try again later",
+            "temporarily unavailable",
+            "service unavailable",
+            "connection error",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "disconnect",
+            "disconnected",
+            "network",
+            "timeout",
+            "timed out",
+            "api connection",
+            "api status error",
+            "upstream",
+        )
+        return any(needle in text for needle in transient_needles)
+
+    @staticmethod
+    def _queue_retry_delay_seconds(error: object) -> int:
+        """Conservative delay before the process loop pops the preserved item."""
+        text = str(error or "")
+        patterns = (
+            r"retry[-_ ]?after[^0-9]{0,20}(\d{1,6})",
+            r"try again in[^0-9]{0,20}(\d{1,6})\s*(s|sec|second|seconds|m|min|minute|minutes)?",
+            r"reset[^0-9]{0,20}(\d{1,6})\s*(s|sec|second|seconds|m|min|minute|minutes)?",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            unit = (match.group(2) if len(match.groups()) >= 2 else "") or ""
+            if unit.lower().startswith(("m", "min")):
+                value *= 60
+            return max(5, min(value, 3600))
+        if "429" in text or "rate limit" in text.lower() or "too many requests" in text.lower():
+            return 300
+        return 30
+
+    def _preserve_failed_queued_input(self, queued_item) -> bool:
+        """Requeue the current item after a transient start/API failure."""
+        error = getattr(self, "_last_chat_queue_preserve_error", None)
+        if not error:
+            return False
+        self._last_chat_queue_preserve_error = None
+        if not self._push_pending_input_front(queued_item):
+            return False
+        delay = self._queue_retry_delay_seconds(error)
+        self._pending_input_retry_at = time.time() + delay
+        _cprint(
+            f"\n{_DIM}Queued message preserved after transient error; "
+            f"retrying after ~{delay}s instead of draining the queue.{_RST}"
+        )
+        return True
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -3990,7 +4140,8 @@ class HermesCLI:
 
         # 2. Replace untouched default with a Codex model
         if self._model_is_default:
-            fallback_model = "gpt-5.3-codex"
+            from hermes_cli.codex_models import DEFAULT_CODEX_MODELS
+            fallback_model = DEFAULT_CODEX_MODELS[0]
             try:
                 from hermes_cli.codex_models import get_codex_model_ids
 
@@ -4172,7 +4323,42 @@ class HermesCLI:
         if "\n" in text:
             ChatConsole().print(self._format_submitted_user_message_preview(text))
         else:
-            ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(text)}[/]")
+            ChatConsole().print(self._format_submitted_user_message_preview(text))
+
+    @staticmethod
+    def _action_timestamp() -> str:
+        """Return a compact wall-clock timestamp for CLI action events."""
+        return datetime.now().strftime("%H:%M:%S")
+
+    @staticmethod
+    def _action_preview(value, *, limit: int = 96) -> str:
+        """Return a one-line, bounded preview for queued input/action logs."""
+        if isinstance(value, tuple) and value:
+            text = value[0]
+            images = value[1] if len(value) > 1 else []
+            if text:
+                preview = str(text)
+                if images:
+                    preview = f"{preview} [{len(images)} image{'s' if len(images) != 1 else ''}]"
+            else:
+                preview = f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
+        else:
+            preview = str(value or "")
+        preview = " ".join(preview.replace("\r", " ").replace("\n", " ").split())
+        if len(preview) > limit:
+            preview = preview[: max(0, limit - 1)] + "…"
+        return preview
+
+    def _format_action_event(self, label: str, detail: str = "", *, icon: str = "•") -> str:
+        """Format a timestamped lifecycle/action line for scrollback."""
+        ts = self._action_timestamp()
+        safe_detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(detail)) if detail else ""
+        detail_part = f": {safe_detail}" if safe_detail else ""
+        return f"{_DIM}[{ts}] {icon} {label}{detail_part}{_RST}"
+
+    def _print_action_event(self, label: str, detail: str = "", *, icon: str = "•") -> None:
+        """Print a timestamped lifecycle/action line."""
+        _cprint(self._format_action_event(label, detail, icon=icon))
 
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
@@ -4891,7 +5077,7 @@ class HermesCLI:
                     f"{_escape(resolved_id)}; resuming the descendant with your "
                     f"transcript.[/]"
                 )
-                self.session_id = resolved_id
+                self._set_session_id(resolved_id)
                 resolved_meta = self._session_db.get_session(self.session_id)
                 if resolved_meta:
                     session_meta = resolved_meta
@@ -5172,7 +5358,7 @@ class HermesCLI:
                 f"[dim]Session {self.session_id} was compressed into "
                 f"{resolved_id}; resuming the descendant with your transcript.[/]"
             )
-            self.session_id = resolved_id
+            self._set_session_id(resolved_id)
             resolved_meta = self._session_db.get_session(self.session_id)
             if resolved_meta:
                 session_meta = resolved_meta
@@ -6422,7 +6608,7 @@ class HermesCLI:
         self.session_start = datetime.now()
         timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
-        self.session_id = f"{timestamp_str}_{short_uuid}"
+        self._set_session_id(f"{timestamp_str}_{short_uuid}")
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
@@ -6733,7 +6919,7 @@ class HermesCLI:
             pass
 
         # Switch to the target session
-        self.session_id = target_id
+        self._set_session_id(target_id)
         self._resumed = True
         self._pending_title = None
         _sync_process_session_id(target_id)
@@ -6908,7 +7094,7 @@ class HermesCLI:
 
         # Switch to the new session
         self._transfer_session_yolo(self.session_id, new_session_id)
-        self.session_id = new_session_id
+        self._set_session_id(new_session_id)
         self.session_start = now
         self._pending_title = None
         self._resumed = True  # Prevents auto-title generation
@@ -7808,6 +7994,29 @@ class HermesCLI:
         except Exception:
             return False
 
+    def _resolve_inline_command_name(self, text: str, has_images: bool = False) -> str | None:
+        """Return the canonical slash command name for UI-thread inline dispatch."""
+        if not text or has_images or not _looks_like_slash_command(text):
+            return None
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return cmd.name if cmd else None
+        except Exception:
+            return None
+
+    def _should_handle_qlist_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /qlist should inspect the queue immediately.
+
+        /qlist is a status/introspection command.  It must not wait behind
+        already queued turns in _pending_input, and while an agent run is active
+        it must not wait for self.chat() to finish.  Dispatching it on the UI
+        thread snapshots _pending_input without consuming anything, then returns
+        to the current run/queue processing unchanged.
+        """
+        return self._resolve_inline_command_name(text, has_images=has_images) == "qlist"
+
     def _should_handle_steer_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /steer should be dispatched immediately while the agent is running.
 
@@ -7820,17 +8029,9 @@ class HermesCLI:
         injecting it mid-run.  Dispatching inline on the UI thread calls
         agent.steer() directly, which is thread-safe (uses _pending_steer_lock).
         """
-        if not text or has_images or not _looks_like_slash_command(text):
-            return False
         if not getattr(self, "_agent_running", False):
             return False
-        try:
-            from hermes_cli.commands import resolve_command
-            base = text.split(None, 1)[0].lower().lstrip('/')
-            cmd = resolve_command(base)
-            return bool(cmd and cmd.name == "steer")
-        except Exception:
-            return False
+        return self._resolve_inline_command_name(text, has_images=has_images) == "steer"
 
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
@@ -8294,6 +8495,45 @@ class HermesCLI:
             print("       DISCORD_BOT_TOKEN=your_token")
             print(f"    2. Or configure settings in {display_hermes_home()}/config.yaml")
             print()
+
+    def _queued_input_items(self) -> list[str]:
+        """Return a snapshot of queued next-turn inputs without consuming them."""
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return []
+        mutex = getattr(pending, "mutex", None)
+        queue_items = getattr(pending, "queue", None)
+        if mutex is not None and queue_items is not None:
+            with mutex:
+                return [str(item) for item in list(queue_items)]
+        return []
+
+    def _handle_qlist_command(self) -> None:
+        """Print queued next-turn inputs immediately without touching the model/API.
+
+        In the interactive prompt_toolkit UI, plain print() output is routed
+        through patch_stdout and can be visually swallowed behind the live input
+        area while chat() is streaming.  Route live-TUI output through _cprint()
+        so /qlist behaves like a real interrupt/status command and appears
+        immediately above the prompt.  Outside the TUI, keep plain print() so
+        non-interactive tests and scripts can capture stdout normally.
+        """
+        def _emit(line: str) -> None:
+            if getattr(self, "_app", None):
+                _cprint(line)
+            else:
+                print(line)
+
+        queued = self._queued_input_items()
+        if not queued:
+            _emit("  Queue is empty.")
+            return
+        _emit(f"  Queued commands ({len(queued)}):")
+        for idx, item in enumerate(queued, start=1):
+            preview = item.replace("\n", " ").strip()
+            if len(preview) > 160:
+                preview = preview[:157] + "..."
+            _emit(f"  {idx}. {preview}")
     
     def process_command(self, command: str) -> bool:
         """
@@ -8622,6 +8862,8 @@ class HermesCLI:
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical == "qlist":
+            self._handle_qlist_command()
         elif canonical == "steer":
             # Inject a message after the next tool call without interrupting.
             # If the agent is actively running, push the text into the agent's
@@ -9938,7 +10180,7 @@ class HermesCLI:
                     getattr(self.agent, "session_id", None)
                     and self.agent.session_id != self.session_id
                 ):
-                    self.session_id = self.agent.session_id
+                    self._set_session_id(self.agent.session_id)
                     self._pending_title = None
                     # Manual /compress replaces conversation_history with a new
                     # compressed handoff for the child session. Persist it from
@@ -11636,9 +11878,11 @@ class HermesCLI:
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._last_chat_queue_preserve_error = None
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
+            self._last_chat_queue_preserve_error = "runtime credentials unavailable"
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -11653,6 +11897,7 @@ class HermesCLI:
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
         ):
+            self._last_chat_queue_preserve_error = "agent initialization failed"
             return None
         
         # Route image attachments based on the active model's vision capability.
@@ -11742,7 +11987,10 @@ class HermesCLI:
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
 
-        # Add user message to history
+        # Add user message to history.  Keep a pre-turn snapshot so transient
+        # queue-preserving failures can retry the same prompt without leaving a
+        # duplicate/lost failed user turn in memory.
+        history_before_turn = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": message})
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
@@ -11883,6 +12131,8 @@ class HermesCLI:
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+                    if self._is_queue_preserving_error(_summary):
+                        self._last_chat_queue_preserve_error = _summary
                     result = {
                         "final_response": f"Error: {_summary}",
                         "messages": [],
@@ -12040,11 +12290,17 @@ class HermesCLI:
                 and self.agent.session_id != self.session_id
             ):
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
-                self.session_id = self.agent.session_id
+                self._set_session_id(self.agent.session_id)
                 self._pending_title = None
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+
+            if result and result.get("failed"):
+                _queue_error = result.get("error") or response
+                if self._is_queue_preserving_error(_queue_error):
+                    self._last_chat_queue_preserve_error = str(_queue_error)
+                    self.conversation_history = history_before_turn
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -12282,6 +12538,8 @@ class HermesCLI:
             print(f"Session:        {self.session_id}")
             if session_title:
                 print(f"Title:          {session_title}")
+            print(f"Started:        {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Ended:          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"Duration:       {duration_str}")
             print(f"Messages:       {msg_count} ({user_msgs} user, {tool_calls} tool calls)")
         else:
@@ -12484,6 +12742,7 @@ class HermesCLI:
         input_rule_bot,
         voice_status_bar,
         completions_menu,
+        search_toolbar=None,
     ) -> list:
         """Assemble the ordered list of children for the root ``HSplit``.
 
@@ -12507,6 +12766,7 @@ class HermesCLI:
                 input_rule_top,
                 image_bar,
                 input_area,
+                search_toolbar,
                 input_rule_bot,
                 voice_status_bar,
                 completions_menu,
@@ -12805,6 +13065,19 @@ class HermesCLI:
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
+                # Handle /qlist directly on the UI thread.  It is queue/status
+                # introspection, so it must not wait behind existing queued
+                # turns, and during an active run it must not wait for chat() to
+                # finish.  The handler only snapshots _pending_input and returns.
+                if self._should_handle_qlist_command_inline(text, has_images=has_images):
+                    if not self.process_command(text):
+                        self._should_exit = True
+                        if event.app.is_running:
+                            event.app.exit()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    event.app.invalidate()
+                    return
+
                 # Handle /steer while the agent is running immediately on the
                 # UI thread.  Queuing through _pending_input would deadlock the
                 # steer until after the agent loop finishes (process_loop is
@@ -12849,9 +13122,18 @@ class HermesCLI:
                         # Queue for the next turn instead of interrupting
                         self._pending_input.put(payload)
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
-                        _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+                        self._print_action_event(
+                            "Queued for next turn",
+                            self._action_preview(preview, limit=80),
+                            icon="＋",
+                        )
                     elif _effective_mode == "interrupt":
                         self._interrupt_queue.put(payload)
+                        self._print_action_event(
+                            "Received interrupt",
+                            self._action_preview(payload, limit=80),
+                            icon="⚡",
+                        )
                         # Debug: log to file when message enters interrupt queue
                         try:
                             _dbg = _hermes_home / "interrupt_debug.log"
@@ -12880,6 +13162,11 @@ class HermesCLI:
                         pass
                 else:
                     self._pending_input.put(payload)
+                    self._print_action_event(
+                        "Received command" if text and _looks_like_slash_command(text) else "Queued input",
+                        self._action_preview(payload, limit=80),
+                        icon="＋",
+                    )
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(kb, handle_enter)
@@ -13568,6 +13855,10 @@ class HermesCLI:
             command_filter=cli_ref._command_available,
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
+        history_search_toolbar = SearchToolbar(
+            backward_search_prompt="reverse-history: ",
+            forward_search_prompt="history-search: ",
+        )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
             prompt=get_prompt,
@@ -13582,6 +13873,7 @@ class HermesCLI:
                 history_suggest=AutoSuggestFromHistory(),
                 completer=_completer,
             ),
+            search_field=history_search_toolbar,
         )
         # Keep prompt_toolkit on its simple tempfile path. Setting
         # buffer.tempfile = "prompt.md" triggers its complex-tempfile branch,
@@ -14266,6 +14558,7 @@ class HermesCLI:
                     input_rule_bot=input_rule_bot,
                     voice_status_bar=voice_status_bar,
                     completions_menu=completions_menu,
+                    search_toolbar=history_search_toolbar,
                 )
             )
         )
@@ -14282,6 +14575,9 @@ class HermesCLI:
             'prompt': '',
             'prompt-working': '#888888 italic',
             'hint': '#888888 italic',
+            'search-toolbar': '#888888 italic',
+            'search-toolbar.prompt': '#CD7F32 bold',
+            'search-toolbar.text': '#FFF8DC',
             'status-bar': 'bg:#1a1a2e #C0C0C0',
             'status-bar-strong': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-dim': 'bg:#1a1a2e #8B8682',
@@ -14440,6 +14736,12 @@ class HermesCLI:
             while not self._should_exit:
                 try:
                     # Check for pending input with timeout
+                    retry_at = getattr(self, "_pending_input_retry_at", 0.0) or 0.0
+                    if retry_at and time.time() < retry_at:
+                        time.sleep(min(0.5, max(0.05, retry_at - time.time())))
+                        continue
+                    if retry_at and time.time() >= retry_at:
+                        self._pending_input_retry_at = 0.0
                     try:
                         user_input = self._pending_input.get(timeout=0.1)
                     except queue.Empty:
@@ -14458,6 +14760,12 @@ class HermesCLI:
                     
                     if not user_input:
                         continue
+                    queued_input_item = user_input
+                    self._print_action_event(
+                        "Dequeued input",
+                        self._action_preview(queued_input_item),
+                        icon="↳",
+                    )
 
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
@@ -14492,20 +14800,29 @@ class HermesCLI:
                             )
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
-                        _cprint(f"\n⚙️  {user_input}")
+                        self._print_action_event(
+                            "Starting command",
+                            self._action_preview(user_input),
+                            icon="⚙",
+                        )
                         try:
                             if not self.process_command(user_input):
                                 self._should_exit = True
                                 # Schedule app exit
                                 if app.is_running:
                                     app.exit()
+                            self._print_action_event(
+                                "Finished command",
+                                self._action_preview(user_input),
+                                icon="✓",
+                            )
                         except KeyboardInterrupt:
                             # Ctrl+C during a slow slash command (e.g. /skills browse,
                             # /sessions list with a large DB) should interrupt the
                             # command and return to the prompt, NOT exit the entire
                             # session. Without this guard a KeyboardInterrupt unwinds
                             # to the outer prompt_toolkit loop and the session dies.
-                            _cprint("\n[dim]Command interrupted.[/dim]")
+                            self._print_action_event("Command interrupted", icon="⚠")
                         continue
                     
                     # Expand paste references back to full content
@@ -14522,11 +14839,18 @@ class HermesCLI:
                         _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
                     # Regular chat - run agent
+                    self._print_action_event(
+                        "Starting turn",
+                        self._action_preview((user_input, submit_images) if submit_images else user_input),
+                        icon="▶",
+                    )
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
+                    preserved_failed_queue_item = False
 
                     try:
                         self.chat(user_input, images=submit_images or None)
+                        preserved_failed_queue_item = self._preserve_failed_queued_input(queued_input_item)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -14534,7 +14858,16 @@ class HermesCLI:
                         self._pending_tool_info.clear()
                         self._last_scrollback_tool = ""
 
+                        duration = getattr(self, "_prompt_duration", 0.0) or 0.0
+                        detail = f"{duration:.1f}s"
+                        if preserved_failed_queue_item:
+                            detail += " (queued input preserved)"
+                        self._print_action_event("Finished turn", detail, icon="✓")
+
                         app.invalidate()  # Refresh status line
+
+                        if preserved_failed_queue_item:
+                            continue
 
                         # Goal continuation: if a standing goal is active, ask
                         # the judge whether the turn satisfied it. If not, and

@@ -358,22 +358,17 @@ if is_termux; then
     export PATH="$COMMAND_LINK_DIR:$PATH"
     echo -e "${GREEN}✓${NC} $COMMAND_LINK_DISPLAY_DIR is already on PATH in Termux"
 else
-    # Determine the appropriate shell config file
+    # Determine the appropriate shell config file. Only emit bash/zsh-specific
+    # reload instructions when the user's actual login shell is bash or zsh;
+    # falling back to an arbitrary existing rc file is misleading for fish,
+    # nushell, PowerShell, etc.
     SHELL_CONFIG=""
-    if [[ "$SHELL" == *"zsh"* ]]; then
+    SHELL_NAME="$(basename "${SHELL:-}" 2>/dev/null || true)"
+    if [[ "$SHELL_NAME" == "zsh" ]]; then
         SHELL_CONFIG="$HOME/.zshrc"
-    elif [[ "$SHELL" == *"bash"* ]]; then
+    elif [[ "$SHELL_NAME" == "bash" ]]; then
         SHELL_CONFIG="$HOME/.bashrc"
         [ ! -f "$SHELL_CONFIG" ] && SHELL_CONFIG="$HOME/.bash_profile"
-    else
-        # Fallback to checking existing files
-        if [ -f "$HOME/.zshrc" ]; then
-            SHELL_CONFIG="$HOME/.zshrc"
-        elif [ -f "$HOME/.bashrc" ]; then
-            SHELL_CONFIG="$HOME/.bashrc"
-        elif [ -f "$HOME/.bash_profile" ]; then
-            SHELL_CONFIG="$HOME/.bash_profile"
-        fi
     fi
 
     if [ -n "$SHELL_CONFIG" ]; then
@@ -431,14 +426,25 @@ if is_termux; then
     echo "     hermes"
     echo ""
 else
-    echo "  1. Reload your shell:"
-    echo "     source $SHELL_CONFIG"
-    echo ""
-    echo "  2. Run the setup wizard to configure API keys:"
-    echo "     hermes setup"
-    echo ""
-    echo "  3. Start chatting:"
-    echo "     hermes"
+    if [ -n "$SHELL_CONFIG" ]; then
+        echo "  1. Reload your shell:"
+        echo "     source $SHELL_CONFIG"
+        echo ""
+        echo "  2. Run the setup wizard to configure API keys:"
+        echo "     hermes setup"
+        echo ""
+        echo "  3. Start chatting:"
+        echo "     hermes"
+    else
+        echo "  1. Ensure $COMMAND_LINK_DISPLAY_DIR is on PATH for your shell"
+        echo "     (or run Hermes directly from $COMMAND_LINK_DISPLAY_DIR/hermes)"
+        echo ""
+        echo "  2. Run the setup wizard to configure API keys:"
+        echo "     hermes setup"
+        echo ""
+        echo "  3. Start chatting:"
+        echo "     hermes"
+    fi
     echo ""
 fi
 echo "Other commands:"

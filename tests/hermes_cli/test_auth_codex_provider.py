@@ -303,20 +303,13 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     assert auth["providers"]["openai-codex"]["tokens"]["access_token"] == "new-at"
 
 
-def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatch):
-    """Re-auth must also refresh ``manual:device_code`` pool entries.
+def test_save_codex_tokens_syncs_matching_manual_device_code_entries(tmp_path, monkeypatch):
+    """Re-auth refreshes manual rows only when they alias the old singleton.
 
-    Regression for #33538: a user who hit #33000 before the #33164 fix landed
-    would have run ``hermes auth add openai-codex`` as a workaround, leaving
-    a pool entry with ``source="manual:device_code"``.  On every subsequent
-    re-auth via setup/model picker, the singleton-seeded ``device_code`` entry
-    got refreshed but the ``manual:device_code`` entry stayed stale, recreating
-    the same 401 token_invalidated symptom that #33164 was supposed to fix.
-
-    An interactive Codex device-code re-auth proves the user owns the ChatGPT
-    account, so it is safe to refresh every device-code-backed entry in the
-    pool — but NOT independent ``manual:api_key`` entries (separate accounts /
-    explicit API keys).
+    Regression for #33538: a manual ``device_code`` workaround could contain
+    the same token pair as ``providers.openai-codex``.  Re-authing that
+    singleton should update the alias too.  Distinct manual OAuth accounts are
+    covered by ``test_save_codex_tokens_does_not_overwrite_distinct_manual_device_code_account``.
     """
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -342,8 +335,8 @@ def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatc
                     "id": "auth-add",
                     "source": "manual:device_code",
                     "auth_type": "oauth",
-                    "access_token": "stale-manual-at",
-                    "refresh_token": "stale-manual-rt",
+                    "access_token": "old-at",
+                    "refresh_token": "old-rt",
                     "last_status": "exhausted",
                     "last_error_code": 401,
                     "last_error_reason": "token_invalidated",
@@ -383,6 +376,67 @@ def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatc
     api_key = next(e for e in pool if e["source"] == "manual:api_key")
     assert api_key["access_token"] == "user-api-key"
     assert "refresh_token" not in api_key or api_key.get("refresh_token") is None
+
+
+def test_save_codex_tokens_does_not_overwrite_distinct_manual_device_code_account(tmp_path, monkeypatch):
+    """A fresh singleton re-auth must not rewrite a separate manual OAuth account.
+
+    ``manual:device_code`` means an explicitly-added pool credential, not
+    necessarily the same ChatGPT account as ``providers.openai-codex``.  A
+    device-code login for account A should refresh only the singleton-derived
+    row for account A, leaving account B available in the rotation.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-a-at", "refresh_token": "old-a-rt"},
+                "last_refresh": "2026-01-01T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "account-a",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "old-a-at",
+                    "refresh_token": "old-a-rt",
+                    "last_status": "exhausted",
+                    "last_error_code": 401,
+                },
+                {
+                    "id": "account-b",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "account-b-at",
+                    "refresh_token": "account-b-rt",
+                    "last_status": "ok",
+                },
+            ],
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_codex_tokens({"access_token": "new-a-at", "refresh_token": "new-a-rt"},
+                       last_refresh="2026-06-30T00:00:00Z")
+
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    pool = auth["credential_pool"]["openai-codex"]
+    account_a = next(e for e in pool if e["id"] == "account-a")
+    account_b = next(e for e in pool if e["id"] == "account-b")
+
+    assert account_a["access_token"] == "new-a-at"
+    assert account_a["refresh_token"] == "new-a-rt"
+    assert account_a["last_status"] is None
+    assert account_a["last_error_code"] is None
+
+    assert account_b["access_token"] == "account-b-at"
+    assert account_b["refresh_token"] == "account-b-rt"
+    assert account_b["last_status"] == "ok"
 
 
 def test_import_codex_cli_tokens(tmp_path, monkeypatch):

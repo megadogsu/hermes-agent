@@ -603,6 +603,10 @@ terminal(command="tmux new-session -d -s resumed 'hermes --continue'", timeout=1
 terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_143052_a1b2c3'", timeout=10)
 ```
 
+### tmux-resurrect auto-resume
+
+Hermes CLI publishes a live marker at `$HERMES_HOME/runtime/tmux-resurrect/<pid>.tsv` containing `session_id`, launch directory, and profile. A tmux-resurrect hook can read that marker during save and restore the pane with `hermes --resume <session_id>` on the next tmux restore. Keep the marker updated whenever `session_id` changes (`/new`, `/resume`, `/branch`, `/compact`/auto-compression).
+
 ### Tips
 
 - **Prefer `delegate_task` for quick subtasks** — less overhead than spawning a full process
