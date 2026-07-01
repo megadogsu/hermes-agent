@@ -473,7 +473,6 @@ def _run_curses_menu(
                     draw_footer(stdscr, max_y, max_x)
 
                 stdscr.refresh()
-
                 if use_search:
                     key = stdscr.getch()
 
@@ -535,6 +534,7 @@ def curses_checklist(
     *,
     cancel_returns: Set[int] | None = None,
     status_fn: Optional[Callable[[Set[int]], str]] = None,
+    enter_selects_current_when_empty: bool = False,
 ) -> Set[int]:
     """Curses multi-select checklist. Returns set of selected indices.
 
@@ -546,6 +546,9 @@ def curses_checklist(
         status_fn: Optional callback ``f(chosen_indices) -> str`` whose return
             value is rendered on the bottom row of the terminal.  Use this for
             live aggregate info (e.g. estimated token counts).
+        enter_selects_current_when_empty: If true, pressing Enter with no
+            checked items selects the highlighted row and returns it. Useful for
+            one-off setup pickers where Enter means "choose this item".
     """
     if cancel_returns is None:
         cancel_returns = set(selected)
@@ -559,9 +562,14 @@ def curses_checklist(
             if curses.has_colors():
                 hattr |= curses.color_pair(2)
             stdscr.addnstr(0, 0, title, max_x - 1, hattr)
+            help_text = (
+                "  ↑↓ navigate  SPACE toggle  ENTER select/confirm  ESC cancel"
+                if enter_selects_current_when_empty
+                else "  ↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel"
+            )
             stdscr.addnstr(
                 1, 0,
-                "  ↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel",
+                help_text,
                 max_x - 1, curses.A_DIM,
             )
         except curses.error:
@@ -602,6 +610,8 @@ def curses_checklist(
             chosen.symmetric_difference_update({cursor})
             return _KEEP
         if action == NAV_SELECT:
+            if enter_selects_current_when_empty and not chosen and items:
+                chosen.add(cursor)
             return set(chosen)
         return cancel_returns  # NAV_CANCEL
 

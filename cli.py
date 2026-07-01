@@ -182,6 +182,46 @@ _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Return a bool for config/env values without trusting YAML scalars blindly."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "always"}:
+        return True
+    if text in {"0", "false", "no", "off", "never"}:
+        return False
+    return default
+
+
+def _chunk_discord_message(message: str, *, limit: int = 1900) -> list[str]:
+    """Split a message into Discord-safe chunks below the 2000-char API cap."""
+    text = str(message or "").strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at < max(200, limit // 3):
+            split_at = limit
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def _tmux_resume_marker_dir() -> Path:
+    """Directory used by tmux-resurrect hooks to discover live Hermes sessions."""
+    return _hermes_home / "runtime" / "tmux-resurrect"
+
+
+def _tmux_resume_marker_path(pid: int | None = None) -> Path:
+    return _tmux_resume_marker_dir() / f"{pid or os.getpid()}.tsv"
+
+
 _REASONING_TAGS = (
     "REASONING_SCRATCHPAD",
     "think",
@@ -3775,6 +3815,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
         self._input_mode_recovery_notice_shown = False
+
+        # Optional CLI → Discord mirror.  When enabled, user commands, agent
+        # replies, tool progress, and status/errors are copied to the configured
+        # Discord home channel via a non-blocking background sender.
+        display_cfg = CLI_CONFIG.get("display", {}) or {}
+        self.discord_mirror_enabled = _coerce_bool(
+            os.getenv("HERMES_CLI_DISCORD_MIRROR", display_cfg.get("discord_mirror", False)),
+            default=False,
+        )
+        self.discord_mirror_channel = str(
+            os.getenv("HERMES_CLI_DISCORD_CHANNEL")
+            or display_cfg.get("discord_mirror_channel")
+            or os.getenv("DISCORD_HOME_CHANNEL", "")
+        ).strip()
+        self.discord_mirror_thread_id = str(
+            os.getenv("HERMES_CLI_DISCORD_THREAD")
+            or display_cfg.get("discord_mirror_thread_id")
+            or ""
+        ).strip()
+        raw_mirror_events = os.getenv("HERMES_CLI_DISCORD_EVENTS") or display_cfg.get(
+            "discord_mirror_events",
+            ["user", "assistant", "command", "status", "error", "tool"],
+        )
+        if isinstance(raw_mirror_events, str):
+            self.discord_mirror_events = {
+                item.strip().lower()
+                for item in raw_mirror_events.split(",")
+                if item.strip()
+            }
+        elif isinstance(raw_mirror_events, (list, tuple, set)):
+            self.discord_mirror_events = {
+                str(item).strip().lower()
+                for item in raw_mirror_events
+                if str(item).strip()
+            }
+        else:
+            self.discord_mirror_events = {"user", "assistant", "command", "status", "error", "tool"}
+        self._discord_mirror_queue: queue.Queue[str] = queue.Queue(maxsize=200)
+        self._discord_mirror_worker_started = False
+        self._discord_mirror_worker_failed = False
         
         # Configuration - priority: CLI args > env vars > config file
         # Model comes from: CLI arg or config.yaml (single source of truth).
@@ -5901,6 +5981,77 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._stream_table_buf = []
         self._in_stream_table = False
 
+    def _start_discord_mirror_worker(self) -> None:
+        """Start the background Discord mirror sender once per CLI process."""
+        if self._discord_mirror_worker_started:
+            return
+        if not self.discord_mirror_enabled or not self.discord_mirror_channel:
+            return
+        self._discord_mirror_worker_started = True
+        self._discord_mirror_worker_failed = False
+
+        def _worker() -> None:
+            try:
+                import asyncio as _asyncio
+                from types import SimpleNamespace
+                from plugins.platforms.discord.adapter import _standalone_send
+            except Exception as exc:
+                logger.debug("Discord mirror import failed: %s", exc, exc_info=True)
+                self._discord_mirror_worker_failed = True
+                self._discord_mirror_worker_started = False
+                return
+            pconfig = SimpleNamespace(token=os.getenv("DISCORD_BOT_TOKEN", ""))
+            while True:
+                payload = self._discord_mirror_queue.get()
+                try:
+                    for chunk in _chunk_discord_message(payload):
+                        try:
+                            result = _asyncio.run(_standalone_send(
+                                pconfig,
+                                self.discord_mirror_channel,
+                                chunk,
+                                thread_id=self.discord_mirror_thread_id or None,
+                            ))
+                            if isinstance(result, dict) and result.get("error"):
+                                logger.debug("Discord mirror send failed: %s", result.get("error"))
+                        except Exception as exc:
+                            logger.debug("Discord mirror send failed: %s", exc, exc_info=True)
+                finally:
+                    self._discord_mirror_queue.task_done()
+
+        threading.Thread(target=_worker, name="hermes-discord-mirror", daemon=True).start()
+
+    def _discord_mirror(self, label: str, text: Any) -> None:
+        """Best-effort non-blocking mirror of important CLI events to Discord."""
+        if not self.discord_mirror_enabled or not self.discord_mirror_channel:
+            return
+        normalized_label = str(label or "").strip().lower()
+        allowed_events = getattr(self, "discord_mirror_events", None)
+        if allowed_events and "all" not in allowed_events and normalized_label not in allowed_events:
+            return
+        body = str(text or "").strip()
+        if not body:
+            return
+        self._start_discord_mirror_worker()
+        if not self._discord_mirror_worker_started:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        session = getattr(self, "session_id", "") or "default"
+        payload = f"**Hermes CLI {normalized_label or 'event'}** `{timestamp}` `{session}`\n{body}"
+        try:
+            self._discord_mirror_queue.put_nowait(payload)
+        except queue.Full:
+            logger.warning("Discord mirror queue full; dropping %s update", normalized_label or label)
+
+    def _format_mirror_user_message(self, message: Any) -> str:
+        """Compact rendering for text or multimodal user messages."""
+        if isinstance(message, str):
+            return message
+        try:
+            return json.dumps(message, ensure_ascii=False)[:3000]
+        except Exception:
+            return str(message)[:3000]
+
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
         cmd_lower = command.lower().strip()
@@ -5932,6 +6083,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Expose a temporary busy state in the TUI while a slash command runs."""
         self._command_running = True
         self._command_status = status
+        self._discord_mirror("status", status)
         self._invalidate(min_interval=0.0)
         try:
             print(f"⏳ {status}")
@@ -8324,6 +8476,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Lowercase only for dispatch matching; preserve original case for arguments
         cmd_lower = command.lower().strip()
         cmd_original = command.strip()
+        self._discord_mirror("command", cmd_original)
 
         # Resolve aliases via central registry so adding an alias is a one-line
         # change in hermes_cli/commands.py instead of touching every dispatch site.
@@ -10848,15 +11001,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
+            if function_name and not function_name.startswith("_"):
+                duration = kwargs.get("duration", 0.0)
+                is_error = kwargs.get("is_error", False)
+                status = "failed" if is_error else "completed"
+                self._discord_mirror("tool", f"{function_name} {status} ({duration:.1f}s)")
             # Print stacked scrollback line for "new" / "all" / "verbose" modes.
-            # "verbose" was previously omitted here, so non-streaming model
-            # calls (MoA aggregator, copilot-acp) rendered each tool only into
-            # the transient spinner line — which overwrites itself, so no
-            # scrollable tool history accumulated. Streaming models hid the bug
-            # because _on_tool_gen_start commits a "preparing" line per tool;
-            # non-streaming calls never emit that, leaving verbose mode with no
-            # committed line at all. "verbose" is strictly more than "all", so
-            # it must commit at least the same line.
+            # "verbose" is strictly more than "all", so it must commit at least
+            # the same line; non-streaming model calls otherwise only update the
+            # transient spinner line and leave no scrollable history.
             if function_name and self.tool_progress_mode in {"new", "all", "verbose"}:
                 duration = kwargs.get("duration", 0.0)
                 is_error = kwargs.get("is_error", False)
@@ -10914,6 +11067,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
+            self._discord_mirror("tool", f"{emoji} {label}")
             self._tool_start_time = time.monotonic()
             # Store args for stacked scrollback line on completion
             self._pending_tool_info.setdefault(function_name, []).append(
@@ -12058,6 +12212,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
+        self._discord_mirror("user", self._format_mirror_user_message(message))
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
@@ -12541,6 +12696,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         width=self._scrollback_box_width(),
                     ))
 
+            if response:
+                self._discord_mirror("assistant", response)
+
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
@@ -12599,6 +12757,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return response
             
         except Exception as e:
+            self._discord_mirror("error", f"Error: {e}")
             print(f"Error: {e}")
             return None
         finally:

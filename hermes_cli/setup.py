@@ -334,7 +334,13 @@ def prompt_yes_no(question: str, default: bool = True) -> bool:
         print_error("Please enter 'y' or 'n'")
 
 
-def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list:
+def prompt_checklist(
+    title: str,
+    items: list,
+    pre_selected: list = None,
+    *,
+    enter_selects_current_when_empty: bool = False,
+) -> list:
     """
     Display a multi-select checklist and return the indices of selected items.
 
@@ -359,6 +365,7 @@ def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list
         items,
         set(pre_selected),
         cancel_returns=set(pre_selected),
+        enter_selects_current_when_empty=enter_selects_current_when_empty,
     )
     return sorted(chosen)
 
@@ -1982,7 +1989,12 @@ def setup_gateway(config: dict):
         if status == "configured":
             pre_selected.append(i)
 
-    selected = prompt_checklist("Select platforms to configure:", items, pre_selected)
+    selected = prompt_checklist(
+        "Select platforms to configure:",
+        items,
+        pre_selected,
+        enter_selects_current_when_empty=True,
+    )
 
     if not selected:
         print_info("No platforms selected. Run 'hermes setup gateway' later to configure.")
