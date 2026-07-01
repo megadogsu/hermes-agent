@@ -39,6 +39,7 @@ def curses_checklist(
     *,
     cancel_returns: Set[int] | None = None,
     status_fn: Optional[Callable[[Set[int]], str]] = None,
+    enter_selects_current_when_empty: bool = False,
 ) -> Set[int]:
     """Curses multi-select checklist. Returns set of selected indices.
 
@@ -50,6 +51,10 @@ def curses_checklist(
         status_fn: Optional callback ``f(chosen_indices) -> str`` whose return
             value is rendered on the bottom row of the terminal.  Use this for
             live aggregate info (e.g. estimated token counts).
+        enter_selects_current_when_empty: If true, pressing Enter with no
+            checked items selects the highlighted row and returns it. This is
+            useful for one-off setup pickers where users naturally treat Enter
+            as "choose this item" instead of "confirm an empty selection".
     """
     if cancel_returns is None:
         cancel_returns = set(selected)
@@ -88,9 +93,14 @@ def curses_checklist(
                     if curses.has_colors():
                         hattr |= curses.color_pair(2)
                     stdscr.addnstr(0, 0, title, max_x - 1, hattr)
+                    help_text = (
+                        "  ↑↓ navigate  SPACE toggle  ENTER select/confirm  ESC cancel"
+                        if enter_selects_current_when_empty
+                        else "  ↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel"
+                    )
                     stdscr.addnstr(
                         1, 0,
-                        "  ↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel",
+                        help_text,
                         max_x - 1, curses.A_DIM,
                     )
                 except curses.error:
@@ -146,6 +156,8 @@ def curses_checklist(
                 elif key == ord(" "):
                     chosen.symmetric_difference_update({cursor})
                 elif key in {curses.KEY_ENTER, 10, 13}:
+                    if enter_selects_current_when_empty and not chosen and items:
+                        chosen.add(cursor)
                     result_holder[0] = set(chosen)
                     return
                 elif key in {27, ord("q")}:

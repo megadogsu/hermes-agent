@@ -191,8 +191,8 @@ class TestIRCGatewaySetupFreshInstall:
             # Capture what prompt_checklist is asked to display
             checklist_calls = []
 
-            def capture_prompt_checklist(question, choices, pre_selected=None):
-                checklist_calls.append({"question": question, "choices": choices})
+            def capture_prompt_checklist(question, choices, pre_selected=None, **kwargs):
+                checklist_calls.append({"question": question, "choices": choices, "kwargs": kwargs})
                 return []  # nothing selected → clean exit
 
             monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *a, **kw: False)
@@ -215,6 +215,7 @@ class TestIRCGatewaySetupFreshInstall:
             assert "IRC" in choices_text
             assert "💬" in choices_text
             assert "not configured" in choices_text.lower()
+            assert platform_prompt["kwargs"]["enter_selects_current_when_empty"] is True
         finally:
             _unregister_irc_platform()
 

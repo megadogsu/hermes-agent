@@ -1194,6 +1194,14 @@ DEFAULT_CONFIG = {
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+        # CLI → Discord mirror. Best-effort copy of supported visible CLI events
+        # (user messages, final assistant replies, slash commands, status/errors,
+        # and tool start/finish). Hidden chain-of-thought is intentionally never
+        # emitted. Channel falls back to DISCORD_HOME_CHANNEL when blank.
+        "discord_mirror": False,
+        "discord_mirror_channel": "",
+        "discord_mirror_thread_id": "",
+        "discord_mirror_events": ["user", "assistant", "command", "status", "error", "tool"],
         # Auto-delete system-notice replies (e.g. "✨ New session started!",
         # "♻ Restarting gateway…", "⚡ Stopped…") after N seconds on platforms
         # that support message deletion (currently Telegram; other platforms
