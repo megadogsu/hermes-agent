@@ -44,9 +44,28 @@ def test_prompt_choice_falls_back_to_numbered_input(monkeypatch):
 def test_prompt_checklist_uses_shared_curses_checklist(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.curses_ui.curses_checklist",
-        lambda title, items, selected, cancel_returns=None: {0, 2},
+        lambda title, items, selected, cancel_returns=None, **kwargs: {0, 2},
     )
 
     selected = setup_mod.prompt_checklist("Pick tools", ["one", "two", "three"], pre_selected=[1])
 
     assert selected == [0, 2]
+
+
+def test_prompt_checklist_forwards_enter_selects_current_when_empty(monkeypatch):
+    calls = []
+
+    def fake_checklist(title, items, selected, **kwargs):
+        calls.append(kwargs)
+        return {1}
+
+    monkeypatch.setattr("hermes_cli.curses_ui.curses_checklist", fake_checklist)
+
+    selected = setup_mod.prompt_checklist(
+        "Pick platform",
+        ["telegram", "discord"],
+        enter_selects_current_when_empty=True,
+    )
+
+    assert selected == [1]
+    assert calls[0]["enter_selects_current_when_empty"] is True
