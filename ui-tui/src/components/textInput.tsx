@@ -40,6 +40,25 @@ const MULTI_CLICK_MS = 500
 const invert = (s: string) => INV + s + INV_OFF
 const dim = (s: string) => DIM + s + DIM_OFF
 
+export function isMacTmuxRawLfReturn(
+  event: Pick<InputEvent, 'keypress'>,
+  key: Pick<Key, 'return' | 'ctrl' | 'shift' | 'meta' | 'super'>,
+  env: Pick<NodeJS.ProcessEnv, 'TMUX' | 'TERM_PROGRAM' | 'WEZTERM_PANE'> = process.env,
+  platform = process.platform
+): boolean {
+  return (
+    platform === 'darwin' &&
+    Boolean(env.TMUX) &&
+    (env.TERM_PROGRAM === 'WezTerm' || Boolean(env.WEZTERM_PANE)) &&
+    key.return === true &&
+    key.ctrl !== true &&
+    key.shift !== true &&
+    key.meta !== true &&
+    key.super !== true &&
+    event.keypress.sequence === '\n'
+  )
+}
+
 let _seg: Intl.Segmenter | null = null
 const seg = () => (_seg ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' }))
 const STOP_CACHE_MAX = 32
@@ -943,7 +962,7 @@ export function TextInput({
       if (k.return) {
         flushKeyBurst()
 
-        if (k.shift || k.ctrl || (isMac ? isActionMod(k) : k.meta)) {
+        if (k.shift || k.ctrl || (isMac ? isActionMod(k) : k.meta) || isMacTmuxRawLfReturn(event, k)) {
           commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
         } else {
           cbSubmit.current?.(vRef.current)

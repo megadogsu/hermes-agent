@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { shouldPassThroughToGlobalHandler } from '../components/textInput.js'
+import { isMacTmuxRawLfReturn, shouldPassThroughToGlobalHandler } from '../components/textInput.js'
 import { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } from '../lib/platform.js'
 
 const key = (overrides: Record<string, unknown> = {}) =>
@@ -39,5 +39,32 @@ describe('shouldPassThroughToGlobalHandler', () => {
     expect(shouldPassThroughToGlobalHandler('', key({ tab: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ pageUp: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ pageDown: true }))).toBe(true)
+  })
+})
+
+
+describe('isMacTmuxRawLfReturn', () => {
+  const returnKey = key({ return: true }) as any
+
+  it('recognizes raw LF return from Ctrl+J in macOS WezTerm tmux', () => {
+    expect(
+      isMacTmuxRawLfReturn(
+        { keypress: { sequence: '\n' } } as any,
+        returnKey,
+        { TERM_PROGRAM: 'WezTerm', TMUX: '/tmp/tmux-501/default,1,0' },
+        'darwin'
+      )
+    ).toBe(true)
+  })
+
+  it('does not treat plain CR Enter as Ctrl+J', () => {
+    expect(
+      isMacTmuxRawLfReturn(
+        { keypress: { sequence: '\r' } } as any,
+        returnKey,
+        { TERM_PROGRAM: 'WezTerm', TMUX: '/tmp/tmux-501/default,1,0' },
+        'darwin'
+      )
+    ).toBe(false)
   })
 })

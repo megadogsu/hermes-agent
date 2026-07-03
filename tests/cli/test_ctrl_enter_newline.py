@@ -51,6 +51,13 @@ def test_windows_terminal_session_preserves_newline():
             assert cli_mod._preserve_ctrl_enter_newline() is True
 
 
+def test_macos_wezterm_tmux_preserves_ctrl_j_newline():
+    import cli as cli_mod
+    with patch.object(sys, "platform", "darwin"):
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0", "TERM_PROGRAM": "WezTerm"}, clear=True):
+            assert cli_mod._preserve_ctrl_enter_newline() is True
+
+
 def test_pure_local_linux_does_not_preserve():
     """A bare local Linux TTY (no SSH/WSL/WT) keeps c-j → submit so docker exec
     style Enter-as-LF stays usable."""

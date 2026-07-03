@@ -2530,6 +2530,14 @@ def _preserve_ctrl_enter_newline() -> bool:
         return True
     if os.environ.get("WT_SESSION"):
         return True
+    # macOS WezTerm through tmux delivers physical Ctrl+J as bare LF,
+    # while plain Enter remains CR. Preserve LF for multiline input instead
+    # of binding it to submit; otherwise Ctrl+J appears to do nothing when
+    # the user expects the readline-style newline/line-feed behavior.
+    if sys.platform == "darwin" and os.environ.get("TMUX"):
+        term_program = os.environ.get("TERM_PROGRAM", "")
+        if term_program == "WezTerm" or os.environ.get("WEZTERM_PANE"):
+            return True
     if "microsoft" in os.environ.get("WSL_DISTRO_NAME", "").lower():
         return True
     # WSL detection — env vars can be scrubbed under sudo, also peek /proc.
