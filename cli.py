@@ -221,7 +221,6 @@ def _tmux_resume_marker_dir() -> Path:
 def _tmux_resume_marker_path(pid: int | None = None) -> Path:
     return _tmux_resume_marker_dir() / f"{pid or os.getpid()}.tsv"
 
-
 _REASONING_TAGS = (
     "REASONING_SCRATCHPAD",
     "think",

@@ -547,8 +547,9 @@ def curses_checklist(
             value is rendered on the bottom row of the terminal.  Use this for
             live aggregate info (e.g. estimated token counts).
         enter_selects_current_when_empty: If true, pressing Enter with no
-            checked items selects the highlighted row and returns it. Useful for
-            one-off setup pickers where Enter means "choose this item".
+            checked items selects the highlighted row and returns it. This is
+            useful for one-off setup pickers where users naturally treat Enter
+            as "choose this item" instead of "confirm an empty selection".
     """
     if cancel_returns is None:
         cancel_returns = set(selected)
